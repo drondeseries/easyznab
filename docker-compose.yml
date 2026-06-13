@@ -1,0 +1,11 @@
+services:
+  easyznab:
+    container_name: easyznab
+    image: ghcr.io/drondeseries/easyznab:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+    # volumes:
+    #   - ./custom-titles.json:/app/custom-titles.json
