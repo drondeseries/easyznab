@@ -63,6 +63,27 @@ EZ_USER = os.environ.get("EASYNEWS_USER")
 EZ_PASS = os.environ.get("EASYNEWS_PASS")
 CACHE_TTL = int(os.environ.get("CACHE_TTL", os.environ.get("EASYNEWS_CACHE_TTL", "300")))
 ALLOW_PASSWORDED = os.environ.get("ALLOW_PASSWORDED", "true").strip().lower() in ("1", "true", "yes")
+DISCARD_LOW_QUALITY = os.environ.get("DISCARD_LOW_QUALITY", "true").strip().lower() in ("1", "true", "yes")
+EXCLUDE_REGEX_STR = os.environ.get("EASYNEWS_EXCLUDE_REGEX", "").strip()
+
+_TRASH_REJECTION_RE = re.compile(
+    r'\b(?:'
+    r'cam|camrip|hdcam|hd-cam|'
+    r'telesync|telecine|tc|ts|hdts|hd-ts|'
+    r'scr|screener|dvdscr|dvdscreener|bdscr|'
+    r'3d|sbs|ou|h-sbs|h-ou|half-sbs|half-ou|hsbs|hou|halfsbs|halfou|'
+    r'hc|korsub|korean(?:\.|\s|_)*sub'
+    r')\b',
+    re.IGNORECASE
+)
+
+_CUSTOM_EXCLUDE_RE = None
+if EXCLUDE_REGEX_STR:
+    try:
+        _CUSTOM_EXCLUDE_RE = re.compile(EXCLUDE_REGEX_STR, re.IGNORECASE)
+        logger.info(f"Custom exclusion regex active: {EXCLUDE_REGEX_STR}")
+    except Exception as e:
+        logger.error(f"Failed to compile custom exclusion regex '{EXCLUDE_REGEX_STR}': {e}")
 
 class SearchCache:
     def __init__(self, ttl: int = 300):
@@ -1300,6 +1321,20 @@ def filter_and_map(
                 if not quality and title_meta.get("quality"):
                     quality = title_meta.get("quality")
 
+                # Discard low-quality / unwanted release types (TRaSH Guides style)
+                if DISCARD_LOW_QUALITY:
+                    trash_match = _TRASH_REJECTION_RE.search(title)
+                    if trash_match:
+                        matched_word = trash_match.group(0).lower()
+                        if not any(t in matched_word or matched_word in t for t in token_set):
+                            continue
+                if _CUSTOM_EXCLUDE_RE:
+                    custom_match = _CUSTOM_EXCLUDE_RE.search(title)
+                    if custom_match:
+                        matched_word = custom_match.group(0).lower()
+                        if not any(t in matched_word or matched_word in t for t in token_set):
+                            continue
+
                 if strict_match and not matches_title(title, strict_phrase, strict=True):
                     continue
 
@@ -1484,9 +1519,19 @@ def filter_and_map(
             if (passwd and not (allow_password_archives and ALLOW_PASSWORDED)) or virus:
                 continue
 
-
-
-
+            # Discard low-quality / unwanted release types (TRaSH Guides style)
+            if DISCARD_LOW_QUALITY:
+                trash_match = _TRASH_REJECTION_RE.search(title)
+                if trash_match:
+                    matched_word = trash_match.group(0).lower()
+                    if not any(t in matched_word or matched_word in t for t in token_set):
+                        continue
+            if _CUSTOM_EXCLUDE_RE:
+                custom_match = _CUSTOM_EXCLUDE_RE.search(title)
+                if custom_match:
+                    matched_word = custom_match.group(0).lower()
+                    if not any(t in matched_word or matched_word in t for t in token_set):
+                        continue
 
             if strict_match and not matches_title(title, strict_phrase, strict=True):
                 continue
@@ -1868,24 +1913,34 @@ def api():
                             sort_field="dtime",
                             sort_dir="-",
                         )
-                        # Fetch page 2 if saturated to ensure we retrieve older/other seasons/episodes
+                        # Fetch additional pages if saturated to retrieve older/other seasons/episodes
                         returned = data.get("returned", 0) if data else 0
                         if data and returned >= 950:
-                            try:
-                                logger.info(f"Query '{q}' returned {returned} results (saturated). Fetching page 2...")
-                                data2 = c.search(
-                                    query=q,
-                                    file_type=None,
-                                    page=2,
-                                    per_page=1000,
-                                    sort_field="dtime",
-                                    sort_dir="-",
-                                )
-                                if data2 and "data" in data2:
-                                    data["data"] = data.get("data", []) + data2["data"]
-                                    data["returned"] = returned + len(data2["data"])
-                            except Exception as e2:
-                                logger.error(f"Failed to fetch page 2 for query '{q}': {e2}")
+                            max_pages = int(os.environ.get("EASYNEWS_MAX_PAGES", "5"))
+                            current_page = 1
+                            last_page_returned = returned
+                            while last_page_returned >= 950 and current_page < max_pages:
+                                current_page += 1
+                                try:
+                                    logger.info(f"Query '{q}' returned {last_page_returned} results (saturated). Fetching page {current_page}...")
+                                    page_data = c.search(
+                                        query=q,
+                                        file_type=None,
+                                        page=current_page,
+                                        per_page=1000,
+                                        sort_field="dtime",
+                                        sort_dir="-",
+                                    )
+                                    if page_data and "data" in page_data:
+                                        page_len = len(page_data["data"])
+                                        data["data"] = data.get("data", []) + page_data["data"]
+                                        data["returned"] = data.get("returned", 0) + page_len
+                                        last_page_returned = page_len
+                                    else:
+                                        break
+                                except Exception as e2:
+                                    logger.error(f"Failed to fetch page {current_page} for query '{q}': {e2}")
+                                    break
                         _SEARCH_CACHE.set(q, data)
                         return q, data
                     except Exception as e:

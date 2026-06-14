@@ -9,6 +9,8 @@ Easyznab is a high-performance Flask/Gunicorn bridge server that connects Easyne
 - 🔒 **Concurrency & Rate Limit Protection**: Uses a global thread-safe request semaphore to throttle concurrent Solr requests to Easynews, preventing upstream rate limits and empty (`char 0`) search responses.
 - 📂 **Smart Archive Handling**: Automatically groups split RAR releases, checks for pre-existing uploaded NZB files directly on Easynews, and falls back to building functional NZBs on-the-fly.
 - 🧼 **Clean Results**: Automatically filters out samples, duplicates, and viruses from search results.
+- 🔄 **Dynamic Pagination**: Automatically paginates and fetches multiple pages (up to a configurable limit) when search queries are saturated (1,000+ matches), ensuring older content (like season 1 of long-running shows) isn't missed.
+- 🛡️ **TRaSH Guides-Style Filtering**: Built-in support to automatically discard low-quality, unwanted release types (CAM, Telesync, Telecine, Screeners, 3D, and hardcoded Korean subtitles) with smart bypass safety nets for explicit search queries.
 
 ---
 
@@ -27,6 +29,17 @@ NEWZNAB_APIKEY=generate_a_secure_random_key_here
 
 # Whether to allow password-protected releases (default: true)
 ALLOW_PASSWORDED=true
+
+# --- ADVANCED CONFIGURATION ---
+
+# Maximum number of Solr search pages to fetch for saturated queries (default: 5)
+# EASYNEWS_MAX_PAGES=5
+
+# Discard low-quality release types (CAM, TS, TC, Screener, 3D, Korsub) (default: true)
+# DISCARD_LOW_QUALITY=true
+
+# Custom regex to exclude unwanted release titles (case-insensitive)
+# EASYNEWS_EXCLUDE_REGEX=\b(?:my_custom_blacklist_word)\b
 
 # Optional: override server port (default 8080)
 # PORT=8080
