@@ -5,6 +5,7 @@ import re
 import threading
 import time
 import sqlite3
+from collections import OrderedDict
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import quote
@@ -62,6 +63,7 @@ else:
 EZ_USER = os.environ.get("EASYNEWS_USER")
 EZ_PASS = os.environ.get("EASYNEWS_PASS")
 CACHE_TTL = int(os.environ.get("CACHE_TTL", os.environ.get("EASYNEWS_CACHE_TTL", "300")))
+CACHE_MAXSIZE = int(os.environ.get("CACHE_MAXSIZE", "500"))
 ALLOW_PASSWORDED = os.environ.get("ALLOW_PASSWORDED", "true").strip().lower() in ("1", "true", "yes")
 DISCARD_LOW_QUALITY = os.environ.get("DISCARD_LOW_QUALITY", "true").strip().lower() in ("1", "true", "yes")
 EXCLUDE_REGEX_STR = os.environ.get("EASYNEWS_EXCLUDE_REGEX", "").strip()
@@ -86,27 +88,67 @@ if EXCLUDE_REGEX_STR:
         logger.error(f"Failed to compile custom exclusion regex '{EXCLUDE_REGEX_STR}': {e}")
 
 class SearchCache:
-    def __init__(self, ttl: int = 300):
+    """Thread-safe LRU cache with TTL expiry and bounded maxsize to prevent unbounded memory growth."""
+
+    def __init__(self, ttl: int = 300, maxsize: int = 500):
         self.ttl = ttl
-        self.cache = {}
+        self.maxsize = maxsize
+        self.cache: OrderedDict = OrderedDict()
         self.lock = threading.Lock()
-        
+
     def get(self, key: str) -> Optional[Any]:
         with self.lock:
             if key in self.cache:
                 val, expiry = self.cache[key]
                 if time.time() < expiry:
+                    # Move to end (most recently used)
+                    self.cache.move_to_end(key)
                     return val
                 else:
                     del self.cache[key]
             return None
-            
+
     def set(self, key: str, value: Any):
         with self.lock:
+            if key in self.cache:
+                self.cache.move_to_end(key)
             self.cache[key] = (value, time.time() + self.ttl)
+            # Evict oldest entry if over capacity
+            while len(self.cache) > self.maxsize:
+                self.cache.popitem(last=False)
 
-_SEARCH_CACHE = SearchCache(ttl=CACHE_TTL)
-_NZB_CACHE = SearchCache(ttl=3600)
+    def purge_expired(self):
+        """Remove all expired entries. Called periodically by background thread."""
+        now = time.time()
+        with self.lock:
+            expired = [k for k, (_, exp) in self.cache.items() if now >= exp]
+            for k in expired:
+                del self.cache[k]
+        return len(expired)
+
+    def __len__(self):
+        with self.lock:
+            return len(self.cache)
+
+
+def _cache_cleanup_worker():
+    """Background thread: purge expired entries from all caches every 60 seconds."""
+    while True:
+        time.sleep(60)
+        try:
+            n1 = _SEARCH_CACHE.purge_expired()
+            n2 = _NZB_CACHE.purge_expired()
+            if n1 or n2:
+                logger.debug(f"Cache cleanup: evicted {n1} search + {n2} NZB expired entries")
+        except Exception as e:
+            logger.warning(f"Cache cleanup error: {e}")
+
+
+_SEARCH_CACHE = SearchCache(ttl=CACHE_TTL, maxsize=CACHE_MAXSIZE)
+_NZB_CACHE = SearchCache(ttl=3600, maxsize=200)
+
+_cache_cleanup_thread = threading.Thread(target=_cache_cleanup_worker, daemon=True, name="cache-cleanup")
+_cache_cleanup_thread.start()
 
 
 class DeobfuscationCache:
@@ -209,13 +251,12 @@ def extract_imdb_id(text: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
-_IMDB_TITLE_CACHE: Dict[str, str] = {}
-_IMDB_TITLE_CACHE_LOCK = threading.Lock()
+_IMDB_TITLE_CACHE = SearchCache(ttl=86400, maxsize=1000)
 
 def resolve_imdb_title(imdb_id: str, is_movie: bool = True) -> Optional[str]:
-    with _IMDB_TITLE_CACHE_LOCK:
-        if imdb_id in _IMDB_TITLE_CACHE:
-            return _IMDB_TITLE_CACHE[imdb_id]
+    cached = _IMDB_TITLE_CACHE.get(imdb_id)
+    if cached:
+        return cached
 
     types = ["movie", "series"] if is_movie else ["series", "movie"]
     for t in types:
@@ -227,13 +268,13 @@ def resolve_imdb_title(imdb_id: str, is_movie: bool = True) -> Optional[str]:
                 meta = data.get("meta", {})
                 title = meta.get("name")
                 if title:
-                    with _IMDB_TITLE_CACHE_LOCK:
-                        _IMDB_TITLE_CACHE[imdb_id] = title
+                    _IMDB_TITLE_CACHE.set(imdb_id, title)
                     return title
         except Exception as e:
             logger.error(f"Failed to resolve IMDb ID {imdb_id} via Cinemeta ({t}): {e}")
     return None
 
+_NFO_THREAD_POOL = ThreadPoolExecutor(max_workers=5)
 
 def resolve_nfo_background(base_prefix, nfo_item, json_data, category_id):
     def worker():
@@ -265,7 +306,7 @@ def resolve_nfo_background(base_prefix, nfo_item, json_data, category_id):
         except Exception as e:
             logger.error(f"Failed background NFO de-obfuscation for hash {base_prefix}: {e}")
             
-    threading.Thread(target=worker, daemon=True).start()
+    _NFO_THREAD_POOL.submit(worker)
 
 
 _CUSTOM_TITLES: Dict[str, List[str]] = {}
