@@ -209,7 +209,14 @@ def extract_imdb_id(text: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
+_IMDB_TITLE_CACHE: Dict[str, str] = {}
+_IMDB_TITLE_CACHE_LOCK = threading.Lock()
+
 def resolve_imdb_title(imdb_id: str, is_movie: bool = True) -> Optional[str]:
+    with _IMDB_TITLE_CACHE_LOCK:
+        if imdb_id in _IMDB_TITLE_CACHE:
+            return _IMDB_TITLE_CACHE[imdb_id]
+
     types = ["movie", "series"] if is_movie else ["series", "movie"]
     for t in types:
         url = f"https://v3-cinemeta.stremio.com/meta/{t}/{imdb_id}.json"
@@ -220,6 +227,8 @@ def resolve_imdb_title(imdb_id: str, is_movie: bool = True) -> Optional[str]:
                 meta = data.get("meta", {})
                 title = meta.get("name")
                 if title:
+                    with _IMDB_TITLE_CACHE_LOCK:
+                        _IMDB_TITLE_CACHE[imdb_id] = title
                     return title
         except Exception as e:
             logger.error(f"Failed to resolve IMDb ID {imdb_id} via Cinemeta ({t}): {e}")
@@ -260,9 +269,12 @@ def resolve_nfo_background(base_prefix, nfo_item, json_data, category_id):
 
 
 _CUSTOM_TITLES: Dict[str, List[str]] = {}
+_LAST_CUSTOM_TITLES_PATH: Optional[str] = None
+_LAST_CUSTOM_TITLES_MTIME: float = 0.0
+_CUSTOM_TITLES_LOCK = threading.Lock()
 
 def load_custom_titles() -> Dict[str, List[str]]:
-    global _CUSTOM_TITLES
+    global _CUSTOM_TITLES, _LAST_CUSTOM_TITLES_PATH, _LAST_CUSTOM_TITLES_MTIME
     paths = [
         os.path.join(os.getcwd(), "custom-titles.json"),
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "custom-titles.json"),
@@ -273,20 +285,26 @@ def load_custom_titles() -> Dict[str, List[str]]:
     for p in paths:
         if os.path.exists(p):
             try:
-                with open(p, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if isinstance(data, dict):
-                        _CUSTOM_TITLES = data
-                        logger.info(f"Loaded {len(_CUSTOM_TITLES)} custom titles from {p}")
-                        # Seed deobfuscation cache with custom-titles.json mappings
-                        for title, mappings in data.items():
-                            if isinstance(mappings, list):
-                                for mapping in mappings:
-                                    if isinstance(mapping, dict) and "search" in mapping and "replace_title" in mapping:
-                                        r_title = mapping["replace_title"]
-                                        r_search = mapping["search"]
-                                        _DEOBFUSCATION_CACHE.add_release(r_search, r_title)
-                        return data
+                mtime = os.path.getmtime(p)
+                with _CUSTOM_TITLES_LOCK:
+                    if _LAST_CUSTOM_TITLES_PATH == p and _LAST_CUSTOM_TITLES_MTIME == mtime:
+                        return _CUSTOM_TITLES
+                    with open(p, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        if isinstance(data, dict):
+                            _CUSTOM_TITLES = data
+                            _LAST_CUSTOM_TITLES_PATH = p
+                            _LAST_CUSTOM_TITLES_MTIME = mtime
+                            logger.info(f"Loaded {len(_CUSTOM_TITLES)} custom titles from {p}")
+                            # Seed deobfuscation cache with custom-titles.json mappings
+                            for title, mappings in data.items():
+                                if isinstance(mappings, list):
+                                    for mapping in mappings:
+                                        if isinstance(mapping, dict) and "search" in mapping and "replace_title" in mapping:
+                                            r_title = mapping["replace_title"]
+                                            r_search = mapping["search"]
+                                            _DEOBFUSCATION_CACHE.add_release(r_search, r_title)
+                            return data
             except Exception as e:
                 logger.error(f"Failed to parse custom titles from {p}: {e}")
     logger.info("No custom titles file found")
@@ -534,7 +552,7 @@ _STOPWORDS = {
     "on",
 }
 
-_MIN_DURATION_SECONDS = 360
+_MIN_DURATION_SECONDS = int(os.environ.get("MIN_DURATION_SECONDS", os.environ.get("EASYNEWS_MIN_DURATION", "360")))
 _TOKEN_SPLIT_RE = re.compile(r"[^\w]+", re.UNICODE)
 _QUALITY_RE = re.compile(r"(2160|1440|1080|720|480|360)\s*(p|i)?", re.IGNORECASE)
 _YEAR_RE = re.compile(r"\b(19[2-9]\d|20[0-2]\d)\b")
@@ -580,6 +598,10 @@ _KNOWN_FANSUB_GROUPS = {
     "mtbb",
     "anime-time",
 }
+
+for _grp in os.environ.get("ADDITIONAL_FANSUB_GROUPS", os.environ.get("ANIME_FANSUB_GROUPS", "")).split(","):
+    if _grp.strip():
+        _KNOWN_FANSUB_GROUPS.add(_grp.strip().lower())
 _SANITIZE_SYMBOLS_RE = re.compile(r"[\.\-_:\s]+")
 _NON_ALNUM_RE = re.compile(r"[^\w\sÀ-ÿ]")
 
@@ -1642,6 +1664,13 @@ def map_query_with_custom_titles(q: str, custom_titles: dict) -> List[str]:
         queries.append(q)
         
     return queries
+@APP.route("/health")
+def health():
+    try:
+        c = client()
+        return Response("OK", status=200, mimetype="text/plain")
+    except Exception as e:
+        return Response(f"Unhealthy: {e}", status=500, mimetype="text/plain")
 
 
 @APP.route("/")
@@ -1656,6 +1685,7 @@ def map_query_with_custom_titles(q: str, custom_titles: dict) -> List[str]:
 @APP.route("/v2/api")
 @APP.route("/v2/api/")
 def api():
+    load_custom_titles()
 
 
     if not require_apikey():
@@ -2204,6 +2234,39 @@ def api():
                 url = "https://members.easynews.com/2.0/api/dl-nzb"
                 r = c.s.post(url, data=payload, timeout=60)
                 r.raise_for_status()
+
+                # Self-healing logic for expired search signatures
+                is_empty_nzb = len(r.content) < 500 or b'<file' not in r.content
+                if is_empty_nzb:
+                    logger.warning("Upstream returned an empty NZB (likely due to expired signature). Attempting to fetch a fresh signature...")
+                    search_term = d.get("filename") or ""
+                    if search_term:
+                        fresh_search = c.search(query=search_term, file_type="VIDEO")
+                        fresh_items = fresh_search.get("data", [])
+                        found_fresh = False
+                        for fit in fresh_items:
+                            fh = None
+                            fsig = None
+                            if isinstance(fit, list) and len(fit) >= 12:
+                                fh = fit[0]
+                                fsig = fit[19] if len(fit) > 19 else None
+                            elif isinstance(fit, dict):
+                                fh = fit.get("hash") or fit.get("0") or fit.get("id")
+                                fsig = fit.get("sig") or fit.get("19")
+                            
+                            if fh and fh == d.get("hash") and fsig:
+                                logger.info(f"Found match with fresh signature: {fsig}")
+                                d["sig"] = fsig
+                                fresh_si = to_search_item(d)
+                                fresh_payload = c.build_nzb_payload([fresh_si], name=d.get("title"))
+                                r_fresh = c.s.post(url, data=fresh_payload, timeout=60)
+                                if r_fresh.status_code == 200 and len(r_fresh.content) >= 500 and b'<file' in r_fresh.content:
+                                    r = r_fresh
+                                    found_fresh = True
+                                    logger.info("Successfully regenerated standard NZB using refreshed signature.")
+                                    break
+                        if not found_fresh:
+                            logger.error("Could not locate the file with a valid fresh signature on Easynews.")
             except EasynewsError as e:
                 logger.exception("EasynewsError during standard NZB generation")
                 if "Unauthorized" in str(e) or "login" in str(e).lower() or "redirect" in str(e).lower():

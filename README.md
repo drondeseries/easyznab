@@ -43,6 +43,12 @@ ALLOW_PASSWORDED=true
 
 # Optional: override server port (default 8080)
 # PORT=8080
+
+# Minimum video duration in seconds to filter out samples (default: 360)
+# MIN_DURATION_SECONDS=360
+
+# Comma-separated list of additional fansub groups for anime detection
+# ADDITIONAL_FANSUB_GROUPS=somegroup,anothergroup
 ```
 
 ### 2. Configure Custom Titles (Optional)
