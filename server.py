@@ -5,6 +5,7 @@ import re
 import threading
 import time
 import sqlite3
+import unicodedata
 from collections import OrderedDict
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Set
@@ -15,7 +16,16 @@ from flask import Flask, Response, request
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from easynews_client import EasynewsClient, EasynewsError, SearchItem
+from easynews_client import (
+    EasynewsClient,
+    EasynewsError,
+    SearchItem,
+    _active_endpoint_label,
+    paginate_enabled,
+    max_pages,
+    _SEARCH_ATTEMPT_TIMEOUT,
+)
+from query_replace import parse_rules as _parse_query_replace, apply_rules as _apply_query_replace
 
 
 APP = Flask(__name__)
@@ -67,6 +77,184 @@ CACHE_MAXSIZE = int(os.environ.get("CACHE_MAXSIZE", "500"))
 ALLOW_PASSWORDED = os.environ.get("ALLOW_PASSWORDED", "true").strip().lower() in ("1", "true", "yes")
 DISCARD_LOW_QUALITY = os.environ.get("DISCARD_LOW_QUALITY", "true").strip().lower() in ("1", "true", "yes")
 EXCLUDE_REGEX_STR = os.environ.get("EASYNEWS_EXCLUDE_REGEX", "").strip()
+
+# ── Additional feature flags (ported from Lystad93/Easynews_as_indexer_x) ──────
+# Skip season-pack queries (S05 with no episode) — Easynews rarely carries real
+# season packs, so this stops them from polluting season searches.
+IGNORE_SEASON_PACKS = os.environ.get("IGNORE_SEASON_PACKS", "").strip().lower() in ("1", "true", "yes")
+
+# Skip title-matching filters entirely (let Sonarr/Radarr do their own matching).
+DISABLE_RESULT_FILTERS = os.environ.get("EASYNEWS_DISABLE_FILTERS", "").strip().lower() in ("1", "true", "yes")
+
+# On dedup, keep the newest re-post instead of the first (relevance-ranked) entry.
+DEDUP_KEEP_NEWEST = os.environ.get("EASYNEWS_DEDUP_KEEP_NEWEST", "").strip().lower() in ("1", "true", "yes")
+
+# Keep password-flagged results (flag is often a false positive on VIDEO results).
+ALLOW_PASSWORD = os.environ.get("EASYNEWS_ALLOW_PASSWORD", "").strip().lower() in ("1", "true", "yes")
+
+# Drop connector stopwords from the outbound query (recall fix for titles with
+# 'and/of/the' that Easynews AND-matches but releases omit).
+STRIP_STOPWORDS = os.environ.get("EASYNEWS_STRIP_STOPWORDS", "true").strip().lower() not in ("0", "false", "no", "off")
+
+# Per-title query rewrite rules (e.g. "norsemen => Vikingane").
+# Configured via EASYNEWS_QUERY_REPLACE env var (simple or JSON format).
+QUERY_REPLACE = _parse_query_replace(os.getenv("EASYNEWS_QUERY_REPLACE", ""))
+
+# Fold Norwegian æ/ø/å to ASCII digraphs (ae/oe/aa) in both the outbound query
+# and the title filters — scene releases routinely ASCII-fold these.
+TRANSLITERATE_NORWEGIAN = os.environ.get("EASYNEWS_TRANSLITERATE_NORWEGIAN", "").strip().lower() in ("1", "true", "yes")
+
+_NORWEGIAN_TRANSLITERATION = {
+    ord("æ"): "ae", ord("Æ"): "Ae",
+    ord("ø"): "oe", ord("Ø"): "Oe",
+    ord("å"): "aa", ord("Å"): "Aa",
+}
+
+
+def _transliterate_norwegian(text: str) -> str:
+    """Fold Norwegian æ/ø/å to their conventional ASCII digraphs (ae/oe/aa)."""
+    if not text:
+        return text
+    return text.translate(_NORWEGIAN_TRANSLITERATION)
+
+
+# Extra metadata attrs (subtitle/audio/codecs/bitrate/group/password).
+# AIOStreams reads 'subs' and 'language' attrs for language filtering.
+META_SUBS = os.environ.get("EASYNEWS_META_SUBS", "true").strip().lower() not in ("0", "false", "no", "off")
+META_AUDIO = os.environ.get("EASYNEWS_META_AUDIO", "true").strip().lower() not in ("0", "false", "no", "off")
+META_CODECS = os.environ.get("EASYNEWS_META_CODECS", "true").strip().lower() not in ("0", "false", "no", "off")
+META_BITRATE = os.environ.get("EASYNEWS_META_BITRATE", "true").strip().lower() not in ("0", "false", "no", "off")
+META_GROUP = os.environ.get("EASYNEWS_META_GROUP", "true").strip().lower() not in ("0", "false", "no", "off")
+META_PASSWORD = os.environ.get("EASYNEWS_META_PASSWORD", "true").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _format_bitrate_mbps(raw: Any) -> Optional[str]:
+    """Easynews's `bps` (raw bits/sec) → '12.72 Mbps'."""
+    try:
+        bps = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if bps <= 0:
+        return None
+    return f"{bps / 1_000_000:.2f} Mbps"
+
+
+# Extra search terms (comma-separated). For each term the bridge also runs
+# '<query> <term>' alongside the bare query and merges the results. Easynews
+# AND-matches the term, so a language tag like 'nordic' surfaces releases that
+# the bare relevance ranking buries deep. Example: EASYNEWS_EXTRA_TERMS=nordic
+EXTRA_TERMS = [
+    term.strip()
+    for term in os.environ.get("EASYNEWS_EXTRA_TERMS", "").split(",")
+    if term.strip()
+]
+
+# Run EXTRA_TERMS only as part of the 0-result fallback, not on every search.
+EXTRA_TERMS_FALLBACK_ONLY = os.environ.get("EASYNEWS_EXTRA_TERMS_FALLBACK_ONLY", "").strip().lower() in ("1", "true", "yes")
+
+# Restrict results to releases whose subtitle tracks include at least one of
+# these language codes (e.g. "nor" for Norwegian). Global default; overridable
+# per-request with &subs= on the API URL. Empty = no restriction.
+REQUIRE_SUBS_DEFAULT = [
+    v.strip().lower()
+    for v in os.environ.get("EASYNEWS_REQUIRE_SUBS", "").split(",")
+    if v.strip()
+]
+
+# 0-result fallback: fire alternate spelling / alias queries when the primary
+# search returns nothing. Never wastes requests when the primary found something.
+FALLBACK_SEARCH = os.environ.get("EASYNEWS_FALLBACK_SEARCH", "").strip().lower() in ("1", "true", "yes")
+FALLBACK_TRANSLITERATE = os.environ.get("EASYNEWS_FALLBACK_TRANSLITERATE", "true").strip().lower() not in ("0", "false", "no", "off")
+FALLBACK_ALT_TITLES = os.environ.get("EASYNEWS_FALLBACK_ALT_TITLES", "true").strip().lower() not in ("0", "false", "no", "off")
+
+# ── Language canonicalisation (ISO 639-2 variant folding) ─────────────────────
+# Fold ISO 639-2/B, 2-letter, and dialect codes to a single canonical token so
+# REQUIRE_SUBS / &subs= filters match regardless of which code is used.
+_LANG_GROUPS = (
+    ("nor", ("no", "nb", "nn", "nob", "nno", "nor")),  # Norwegian (+Bokmål/Nynorsk)
+    ("eng", ("en", "eng")), ("swe", ("sv", "swe")), ("dan", ("da", "dan")),
+    ("fin", ("fi", "fin")), ("isl", ("is", "ice", "isl")), ("ara", ("ar", "ara")),
+    ("ger", ("de", "ger", "deu")), ("fre", ("fr", "fre", "fra")),
+    ("spa", ("es", "spa")), ("ita", ("it", "ita")), ("dut", ("nl", "dut", "nld")),
+    ("por", ("pt", "por")), ("rus", ("ru", "rus")), ("pol", ("pl", "pol")),
+    ("cze", ("cs", "cze", "ces")), ("gre", ("el", "gre", "ell")),
+    ("rum", ("ro", "rum", "ron")), ("slo", ("sk", "slo", "slk")),
+    ("chi", ("zh", "chi", "zho")), ("hrv", ("hr", "hrv")), ("hun", ("hu", "hun")),
+    ("jpn", ("ja", "jpn")), ("kor", ("ko", "kor")), ("tur", ("tr", "tur")),
+    ("ukr", ("uk", "ukr")), ("vie", ("vi", "vie")), ("tha", ("th", "tha")),
+)
+_LANG_CANON: Dict[str, str] = {
+    alias: canon for canon, aliases in _LANG_GROUPS for alias in aliases
+}
+
+
+def _canon_langs(codes: List[str]) -> Set[str]:
+    """Fold a list of language codes to canonical tokens."""
+    out: Set[str] = set()
+    for c in codes:
+        c = (c or "").strip().lower()
+        if c:
+            out.add(_LANG_CANON.get(c, c))
+    return out
+
+
+def _join_langs(value: Any) -> Optional[str]:
+    """Normalise a language field (list or comma string) to a clean comma-joined string."""
+    if not value:
+        return None
+    if isinstance(value, str):
+        parts = [p.strip().lower() for p in value.split(",")]
+    elif isinstance(value, (list, tuple)):
+        parts = [str(p).strip().lower() for p in value]
+    else:
+        return None
+    seen: List[str] = []
+    for p in parts:
+        if p:
+            canon = _LANG_CANON.get(p, p)
+            if canon not in seen:
+                seen.append(canon)
+    return ",".join(sorted(seen)) if seen else None
+
+
+# ── Accent-strip helpers for 0-result fallback transliteration ─────────────────
+_VAR_DIGRAPH = {
+    ord("æ"): "ae", ord("Æ"): "Ae", ord("ø"): "oe", ord("Ø"): "Oe",
+    ord("å"): "aa", ord("Å"): "Aa", ord("ä"): "ae", ord("Ä"): "Ae",
+    ord("ö"): "oe", ord("Ö"): "Oe", ord("ü"): "ue", ord("Ü"): "Ue",
+    ord("ß"): "ss",
+}
+_VAR_BAREVOWEL = {
+    ord("æ"): "ae", ord("Æ"): "Ae", ord("ø"): "o", ord("Ø"): "O",
+    ord("å"): "a", ord("Å"): "A", ord("ä"): "a", ord("Ä"): "A",
+    ord("ö"): "o", ord("Ö"): "O", ord("ü"): "u", ord("Ü"): "U",
+    ord("ß"): "ss",
+}
+_VAR_PRESTRIP = {
+    ord("ø"): "o", ord("Ø"): "O", ord("å"): "a", ord("Å"): "A",
+    ord("æ"): "ae", ord("Æ"): "Ae", ord("ß"): "ss", ord("đ"): "d", ord("Đ"): "D",
+    ord("ł"): "l", ord("Ł"): "L",
+}
+
+
+def _strip_accents(text: str) -> str:
+    """Fold any accented/diacritic title to plain ASCII (José→Jose, Köln→Koln)."""
+    pre = text.translate(_VAR_PRESTRIP)
+    nfkd = unicodedata.normalize("NFKD", pre)
+    return "".join(ch for ch in nfkd if not unicodedata.combining(ch))
+
+
+def _spelling_variants(title: str) -> List[str]:
+    """Up to three alternate ASCII spellings: digraph (ø→oe), bare-vowel (ø→o),
+    and full accent-strip. Empty for already-ASCII titles."""
+    if not title:
+        return []
+    out: List[str] = []
+    for conv in (title.translate(_VAR_DIGRAPH), title.translate(_VAR_BAREVOWEL), _strip_accents(title)):
+        conv = conv.strip()
+        if conv and conv != title and conv not in out:
+            out.append(conv)
+    return out
 
 _TRASH_REJECTION_RE = re.compile(
     r'\b(?:'
@@ -362,23 +550,57 @@ def require_apikey() -> bool:
     return key == API_KEY
 
 
+_CLIENT_REFRESHING = False  # guard: only one background refresh at a time
+
+
+def _refresh_login_async() -> None:
+    """Re-login in the background so a search is never blocked on a slow login.
+    HTTP Basic Auth stays on the session, so searches keep working with the
+    existing session while this runs."""
+    global _CLIENT_LAST_LOGIN, _CLIENT_REFRESHING
+    try:
+        _CLIENT.login()  # type: ignore[union-attr]
+        with _CLIENT_LOCK:
+            _CLIENT_LAST_LOGIN = time.time()
+        logger.info("Background session refresh succeeded.")
+    except EasynewsError as e:
+        with _CLIENT_LOCK:
+            _CLIENT_LAST_LOGIN = time.time() - (_CLIENT_LOGIN_TTL - 60)
+        logger.warning(
+            "Background session refresh failed: %s. "
+            "Keeping existing session (HTTP Basic Auth) — searches still work. "
+            "Will retry in ~60s.", e,
+        )
+    finally:
+        with _CLIENT_LOCK:
+            _CLIENT_REFRESHING = False
+
+
 def client() -> EasynewsClient:
     if not EZ_USER or not EZ_PASS:
         raise RuntimeError("Set EASYNEWS_USER and EASYNEWS_PASS environment variables")
-    global _CLIENT, _CLIENT_LAST_LOGIN
+    global _CLIENT, _CLIENT_LAST_LOGIN, _CLIENT_REFRESHING
     with _CLIENT_LOCK:
         now = time.time()
         if _CLIENT is None:
+            logger.info("Starting up: logging in to Easynews for the first time...")
             _CLIENT = EasynewsClient(EZ_USER, EZ_PASS)
             _CLIENT.login()
             _CLIENT_LAST_LOGIN = now
-        elif now - _CLIENT_LAST_LOGIN > _CLIENT_LOGIN_TTL:
-            try:
-                _CLIENT.login()
-            except EasynewsError:
-                _CLIENT = EasynewsClient(EZ_USER, EZ_PASS)
-                _CLIENT.login()
-            _CLIENT_LAST_LOGIN = time.time()
+            _CLIENT.start_keepalive()
+            logger.info("Startup login succeeded. Indexer is ready (endpoint: %s).", _active_endpoint_label())
+            return _CLIENT
+        # Periodic refresh runs in the background so the current request is
+        # never blocked on the login round-trip.
+        if now - _CLIENT_LAST_LOGIN > _CLIENT_LOGIN_TTL and not _CLIENT_REFRESHING:
+            age_mins = int((now - _CLIENT_LAST_LOGIN) / 60)
+            logger.info(
+                "Session is %d min old (TTL=%ds). Refreshing login in background...",
+                age_mins, _CLIENT_LOGIN_TTL,
+            )
+            _CLIENT_REFRESHING = True
+            _CLIENT_LAST_LOGIN = now  # push forward so we don't spawn multiple threads
+            threading.Thread(target=_refresh_login_async, daemon=True, name="session-refresh").start()
         return _CLIENT
 
 
@@ -1452,6 +1674,7 @@ def filter_and_map(
                         "episode": title_meta.get("episode"),
                         "category": category_id,
                         "is_archive": False,
+                        "raw_item": it["raw_item"],
                     }
                 )
         else:
@@ -1650,6 +1873,7 @@ def filter_and_map(
                     "category": category_id,
                     "is_archive": True,
                     "archive_prefix": base_prefix,
+                    "raw_item": first_it["raw_item"],
                 }
             )
 
@@ -1934,6 +2158,17 @@ def api():
                     }
                 ]
         else:
+            # Apply per-title query rewrite rules (e.g. "norsemen => Vikingane")
+            if QUERY_REPLACE:
+                rewritten = _apply_query_replace(q, QUERY_REPLACE)
+                if rewritten != q:
+                    logger.info("Query rewritten: %r → %r", q, rewritten)
+                    q = rewritten
+
+            # Apply Norwegian/accent transliteration if enabled
+            if TRANSLITERATE_NORWEGIAN:
+                q = _transliterate_norwegian(q)
+
             # Custom title expansion
             queries_to_run = map_query_with_custom_titles(q, _CUSTOM_TITLES)
             
@@ -1949,9 +2184,16 @@ def api():
                     if db_hash not in queries_to_run:
                         queries_to_run.append(db_hash)
             
+            # Add EXTRA_TERMS fan-out queries (language boosters like 'nordic')
+            if EXTRA_TERMS and not EXTRA_TERMS_FALLBACK_ONLY:
+                for term in EXTRA_TERMS:
+                    extra_q = f"{q} {term}"
+                    if extra_q not in queries_to_run:
+                        queries_to_run.append(extra_q)
+
             all_results_data = {"data": []}
             seen_hashes = set()
-              # Run query expansions concurrently in parallel
+            # Run query expansions concurrently in parallel
             queries_to_fetch = []
             for search_q in queries_to_run:
                 cached_data = _SEARCH_CACHE.get(search_q)
@@ -2050,6 +2292,79 @@ def api():
                 allow_password_archives=allow_password_archives,
             )
 
+            # 0-result fallback: try spelling variants + alias queries
+            if not items and FALLBACK_SEARCH and not fallback_query:
+                fallback_queries: List[str] = []
+                if FALLBACK_TRANSLITERATE:
+                    fallback_queries.extend(_spelling_variants(base_query))
+                if FALLBACK_ALT_TITLES:
+                    custom_titles_simple = {
+                        k: ([v if isinstance(v, str) else v.get("search", "") for v in vals] if isinstance(vals, list) else [str(vals)])
+                        for k, vals in _CUSTOM_TITLES.items()
+                    }
+                    for k, aliases in custom_titles_simple.items():
+                        kl = k.lower()
+                        ql = base_query.lower()
+                        if kl == ql or kl in ql or ql in kl:
+                            for a in aliases:
+                                if a and a.lower() != ql and a not in fallback_queries:
+                                    fallback_queries.append(a)
+                if EXTRA_TERMS and EXTRA_TERMS_FALLBACK_ONLY:
+                    for term in EXTRA_TERMS:
+                        extra_q = f"{base_query} {term}"
+                        if extra_q not in fallback_queries:
+                            fallback_queries.append(extra_q)
+                if fallback_queries:
+                    logger.info("Primary search returned 0 results. Trying %d fallback queries: %s", len(fallback_queries), fallback_queries[:4])
+                    fallback_data: dict = {"data": []}
+                    fallback_seen: Set[str] = set()
+                    def _do_fallback(fq: str):
+                        try:
+                            c = client()
+                            d = c.search(query=fq, file_type=None, per_page=100, sort_field="dtime", sort_dir="-")
+                            return fq, d
+                        except Exception as e:
+                            logger.debug("Fallback query '%s' failed: %s", fq, e)
+                            return fq, None
+                    with ThreadPoolExecutor(max_workers=min(4, len(fallback_queries))) as ex:
+                        for _fq, _fd in ex.map(lambda fq: _do_fallback(fq), fallback_queries):
+                            if _fd and "data" in _fd:
+                                if not fallback_data.get("thumbURL") and _fd.get("thumbURL"):
+                                    fallback_data["thumbURL"] = _fd["thumbURL"]
+                                for it in _fd["data"]:
+                                    hid = it[0] if isinstance(it, list) and len(it) >= 1 else (it.get("hash") or it.get("0") if isinstance(it, dict) else None)
+                                    if hid and hid not in fallback_seen:
+                                        fallback_seen.add(hid)
+                                        fallback_data["data"].append(it)
+                    if fallback_data["data"]:
+                        items = filter_and_map(
+                            fallback_data,
+                            min_bytes=min_bytes,
+                            query_tokens=query_tokens,
+                            query_meta=query_meta,
+                            strict_phrase=strict_phrase,
+                            strict_match=strict_requested,
+                            custom_titles=_CUSTOM_TITLES,
+                            allow_password_archives=allow_password_archives,
+                        )
+
+            # Apply REQUIRE_SUBS filter (global default, overridable per-request)
+            require_subs_param = request.args.get("subs", "").strip().lower()
+            require_subs = [
+                v.strip().lower() for v in require_subs_param.split(",") if v.strip()
+            ] if require_subs_param else REQUIRE_SUBS_DEFAULT
+            if require_subs:
+                want_langs = _canon_langs(require_subs)
+                def _has_subs(it: dict) -> bool:
+                    raw = it.get("raw_item") if isinstance(it, dict) else None
+                    if not isinstance(raw, dict):
+                        return True  # can't check → let it through
+                    slangs = raw.get("slangs") or raw.get("subtitle_tracks") or []
+                    if isinstance(slangs, str):
+                        slangs = [s.strip() for s in slangs.split(",") if s.strip()]
+                    return bool(_canon_langs(slangs) & want_langs)
+                items = [it for it in items if _has_subs(it)]
+
 
         # Filter by requested category
         if requested_cats:
@@ -2125,6 +2440,39 @@ def api():
                 attr_parts.append(f'<newznab:attr name="season" value="{season}"/>')
             if episode:
                 attr_parts.append(f'<newznab:attr name="episode" value="{episode}"/>')
+
+            # ── Rich metadata attrs from Easynews raw item ──────────────────
+            raw_it = it.get("raw_item") if isinstance(it, dict) else None
+            if isinstance(raw_it, dict):
+                if META_SUBS:
+                    slangs = raw_it.get("slangs") or raw_it.get("subtitle_tracks") or []
+                    subs_str = _join_langs(slangs)
+                    if subs_str:
+                        attr_parts.append(f'<newznab:attr name="subs" value="{xml_escape(subs_str)}"/>')
+                if META_AUDIO:
+                    alangs = raw_it.get("alangs") or raw_it.get("audio_tracks") or []
+                    audio_str = _join_langs(alangs)
+                    if audio_str:
+                        attr_parts.append(f'<newznab:attr name="language" value="{xml_escape(audio_str)}"/>')
+                if META_CODECS:
+                    vcodec = raw_it.get("vcodec") or raw_it.get("video_codec")
+                    acodec = raw_it.get("acodec") or raw_it.get("audio_codec")
+                    if vcodec:
+                        attr_parts.append(f'<newznab:attr name="videocodec" value="{xml_escape(str(vcodec))}"/>')
+                    if acodec:
+                        attr_parts.append(f'<newznab:attr name="audiocodec" value="{xml_escape(str(acodec))}"/>')
+                if META_BITRATE:
+                    bps_str = _format_bitrate_mbps(raw_it.get("bps"))
+                    if bps_str:
+                        attr_parts.append(f'<newznab:attr name="bitrate" value="{xml_escape(bps_str)}"/>')
+                if META_GROUP:
+                    grp = raw_it.get("group") or raw_it.get("newsgroup")
+                    if grp:
+                        attr_parts.append(f'<newznab:attr name="group" value="{xml_escape(str(grp))}"/>')
+                if META_PASSWORD:
+                    is_passwd = bool(raw_it.get("passwd") or raw_it.get("password"))
+                    attr_parts.append(f'<newznab:attr name="password" value="{"1" if is_passwd else "0"}"/>')
+
             attr_xml = "".join(attr_parts)
             item_xml = (
                 f"<item>"
